@@ -3,11 +3,11 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-train = pd.read_csv("../input/train.csv")
-test = pd.read_csv("../input/test.csv")
-text = train["text"][:20]+test["text"][:20]
+train = pd.read_csv("../../input/train.csv")
+test = pd.read_csv("../../input/test.csv")
+text = list(train["text"])[:20]+list(test["text"])[:20]
 
-sent = ["I like python","python is easier to learn","python is loved by a lot of people"]
+sent = text 
 
 word_set = set()
 for s in sent:
