@@ -41,14 +41,6 @@ for l in sent:
 			idx1 = word_to_id[near]
 			co_mat[idx1][idx2] += 1
 			co_mat[idx2][idx1] += 1
-		'''
-		if prev_word != -1:
-			idx1,idx2 = word_to_id[prev_word],word_to_id[w]
-			co_mat[idx1][idx2] += 1
-		if next_word != -1:
-			idx1,idx2 = word_to_id[next_word],word_to_id[w]
-			co_mat[idx1][idx2] += 1
-		'''
 U,s,V_ = np.linalg.svd(co_mat)
 
 print(U.shape)
