@@ -1,4 +1,3 @@
-#Stemming
 import os
 import gc
 import sys
@@ -12,6 +11,26 @@ import logging
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+from nltk.corpus import wordnet as wn
+
+pos_to_wordnet_dict = {
+    'JJ'  :wn.ADJ,
+    'JJR' :wn.ADJ,
+    'JJS' :wn.ADJ,
+    'RB'  :wn.ADV,
+    'RBR' :wn.ADV,
+    'RBS' :wn.ADV,
+    'NN'  :wn.NOUN,
+    'NNP' :wn.NOUN,
+    'NNS' :wn.NOUN,
+    'NNPS':wn.NOUN,
+    'VB'  :wn.VERB,
+    'VBG' :wn.VERB,
+    'VBD' :wn.VERB,
+    'VBN' :wn.VERB,
+    'VBP' :wn.VERB,
+    'VBZ' :wn.VERB,
+}
 
 def prepare_logger():
 	logger = logging.getLogger(__name__)
@@ -52,7 +71,9 @@ def imdb_dataset():
 		document.append(sentence)
 	return np.array(document), train_x 
 
-def shuffle(f):    
+def shuffle(f):   
+	if not isinstance(f, np.ndarray):
+		f = np.array(f)
 	perm = np.random.permutation(len(f))
 	f = f[perm]
 	for item in f:
@@ -65,7 +86,7 @@ def tokenize(document):
 def remove_stopwords(tokenized_list):
 	filtered_list = []
 	for word in tokenized_list:
-		if word not in stopwords:
+		if word not in stopwords and word not in ["<UNK>","<START>","<END>","<PAD>"]:
 			filtered_list.append(word)
 	return filtered_list
 
@@ -73,7 +94,7 @@ def lemmatize_words(tokenized_list):
 	filtered_list = []
 	word_pos = nltk.pos_tag(tokenized_list)
 	for word, pos in word_pos:
-		word = lemmatizer.lemmatize(word, pos)
+		word = lemmatizer.lemmatize(word, pos_to_wordnet_dict.get(pos,'n')) 
 		filtered_list.append(word)
 	return filtered_list
 
@@ -82,11 +103,13 @@ def preprocess(location="../input/train.csv", document=None, tokenized=False):
 	if document is None:
 		df = pd.read_csv(location)
 		document = df["text"]
+	total_sentences = len(document)
+	if not tokenized:
+		document = tokenize(document)
 	processed_doc = []
+	i = 0
 	for sent in document:
 		processed_sent = []
-		if not tokenized:
-			sent = tokenize(sent)
 		for word in lemmatize_words(remove_stopwords(sent)):
 			processed_sent.append(word)
 			if word_set.get(word) is None:
@@ -94,32 +117,37 @@ def preprocess(location="../input/train.csv", document=None, tokenized=False):
 				word_set[word] = word_indx
 
 		processed_doc.append(processed_sent)
-	print(document[0])
-	print(processed_doc[0])
+		i += 1
+		print(f"Finished {100*i/total_sentences}",end="\r")
 
-	def generate_pairs(word_distance, batch_size):
-		context,target = [],[]
-		total_sentences = len(processed_doc) 
-		for sent_indx, tokenized_list in enumerate(shuffle(processed_doc)):
-			if not tokenized:
-				tokenized_list = tokenize(tokenized_list)
-			tokenized_list = list(remove_stopwords(tokenized_list))
-			for indx, context_word in enumerate(tokenized_list):
-				#Sampling is suggested
-				context_row = [] 
-				for distance in range(indx - word_distance, indx + word_distance):
-					if distance == indx or distance < 0 or distance >= len(tokenized_list):
-						context_row.append(0)
-						continue
-					context_row.append(word_set[tokenized_list[distance]])
-				context.append(context_row)
-				target.append(word_set[context_word])
-				#Tensorflow gives not a matrix error for only one example ???
-				if (len(context) == batch_size or sent_indx == total_sentences - 1) and len(context) != 1:
-					yield np.array(context), np.array(target)[..., np.newaxis]
-					context, target = [], []
+	r_idx = np.random.randint(0, total_sentences)
+	print()
+	print(document[r_idx])
+	print(processed_doc[r_idx])
+	save = input("Save processed document?: ")
+	if save.lower() != "no":
+		with open("processed.pickle","wb") as f:
+			pickle.dump(processed_doc, f)
+	return len(word_set), word_set
 
-	return generate_pairs, len(word_set), word_set
+def generate_pairs(word_distance, batch_size, processed_doc):
+	context,target = [],[]
+	total_sentences = len(processed_doc) 
+	for sent_indx, tokenized_list in enumerate(shuffle(processed_doc)):
+		for indx, target_word in enumerate(tokenized_list):
+			#Sampling is suggested
+			context_row = [] 
+			for distance in range(indx - word_distance, indx + word_distance):
+				if distance == indx or distance < 0 or distance >= len(tokenized_list):
+					context_row.append(0)
+					continue
+				context_row.append(word_set[tokenized_list[distance]])
+			context.append(context_row)
+			target.append(word_set[target_word])
+			#Tensorflow gives not a matrix error for only one example ???
+			if (len(context) == batch_size or sent_indx == total_sentences - 1) and len(context) != 1:
+				yield np.array(context), np.array(target)[..., np.newaxis]
+				context, target = [], []
 
 def initialize_parameters(vocab_size, embedding_size):
 	vocab_size += 1 # Adjust for padding
@@ -170,17 +198,23 @@ def model(vocab_size, embedding_size, pair, lr, word_distance):
 	correct_prediction = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(output,1), tf.argmax(labels, 1)), tf.float32),name="accuracy")
 	return optimizer, loss, correct_prediction
 
+def get_data(path = "processed.txt"):
+	with open(path, "rb") as f:
+		document = pickle.load(f)
+	word_set = {}
+	for sent in document:
+		for word in sent:
+			if word_set.get(word) is None:
+				word_set[word] = len(word_set) + 1
+	return document, len(word_set), word_set
 
-def train(embedding_size = 100, word_distance = 5, batch_size = 64, lr = 1e-3, epochs = 10):
+def train(document, vocab_size, embedding_size = 100, word_distance = 5, batch_size = 64, lr = 1e-3, epochs = 10):
 	tf.reset_default_graph()
 	timestamp = str(int(time.time()))
 	logdir = "model/"+timestamp+"/"
 
 	inputs = tf.placeholder(tf.int32, [None, 2*word_distance])
 	labels = tf.placeholder(tf.int32, [None, 1])
-	
-	document, train_x = imdb_dataset()
-	generate_pairs, vocab_size, word_set = preprocess(itr = document, tokenized = True)
 	
 	optimizer, loss, correct_prediction = model(vocab_size, embedding_size, (inputs, labels), lr, word_distance)
 	
@@ -192,7 +226,7 @@ def train(embedding_size = 100, word_distance = 5, batch_size = 64, lr = 1e-3, e
 			for e in range(epochs):	
 				epoch_loss = 0
 				epoch_acc = 0
-				for indx,pair in enumerate(generate_pairs(word_distance, batch_size)):
+				for indx,pair in enumerate(generate_pairs(word_distance, batch_size, document)):
 					if memory_above(95):
 						log_str = f"epoch:{e} indx:{indx}, terminating! high memory usage"
 						logger.info(log_str) 				
@@ -207,7 +241,7 @@ def train(embedding_size = 100, word_distance = 5, batch_size = 64, lr = 1e-3, e
 						)
 					epoch_loss += c
 					epoch_acc += 0
-					if indx % (50) == 0:
+					if indx % (100) == 0:
 						logger.info(f"{timestamp} epoch:{e} indx:{indx}, loss:{epoch_loss} ") 
 						print(f"epoch:{e} indx:{indx}, loss:{epoch_loss} ", end="\r")
 					if indx % (1_00_000) == 0:
@@ -226,8 +260,6 @@ def cosine_distance(v1, v2):
 	"""returns the cosine_distance"""
 	return np.dot(v1, v2)/(np.linalg.norm(v1)*np.linalg.norm(v2))
 
-
-
 def load_file(path):
 	with open(path+"word_set.pickle","rb") as f:
 		word_set = pickle.load(f)
@@ -237,7 +269,6 @@ def load_file(path):
 	with tf.Session() as sess:
 		saver = tf.train.Saver()
 		saver.restore(sess, path+"model.ckpt")
-
 		embedding = embeddings.eval()
 	return word_set,embedding
 
@@ -259,15 +290,14 @@ def test(path):
 		print(top_matches)
 	return most_similar
 
-
 if __name__ == "__main__":
 	print(sys.argv)
-	if sys.argv[1] == "train":
-		train(embedding_size=100, word_distance=3, batch_size=32, lr=1e-2)
-	if sys.argv[1] == "test":
-		if len(sys.argv) != 3:
-			print("Enter directory")
-			sys.exit()
+	
+	if len(sys.argv) >= 2 and sys.argv[1] == "train":
+		document, vocab_size, word_set = get_data()
+		train(document, vocab_size, embedding_size=150, word_distance=5, batch_size=256, lr=1e-3)
+	
+	if len(sys.argv) >= 3 and sys.argv[1] == "test":
 		most_similar = test(f"model/{sys.argv[2]}/")
 		while True:
 			word = input("=>")
