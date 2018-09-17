@@ -1,4 +1,7 @@
+#Stemming
 import os
+import gc
+import sys
 import time
 import nltk
 import keras
@@ -10,6 +13,19 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 
+def prepare_logger():
+	logger = logging.getLogger(__name__)
+	logger.setLevel(logging.INFO)
+
+	handler = logging.FileHandler("train.log")
+	handler.setLevel(logging.INFO)
+
+	logger.addHandler(handler)
+	return logger
+
+logger = prepare_logger()
+stopwords = set(nltk.corpus.stopwords.words("english"))
+lemmatizer = nltk.stem.WordNetLemmatizer()
 def memory_above(critical_val = 95):
 	return (psutil.virtual_memory().percent > critical_val)
 
@@ -36,59 +52,59 @@ def imdb_dataset():
 		document.append(sentence)
 	return np.array(document), train_x 
 
-def prepare_logger():
-	logger = logging.getLogger(__name__)
-	logger.setLevel(logging.INFO)
-
-	handler = logging.FileHandler("train.log")
-	handler.setLevel(logging.INFO)
-
-	logger.addHandler(handler)
-	return logger
-
-logger = prepare_logger()
-
 def shuffle(f):    
 	perm = np.random.permutation(len(f))
 	f = f[perm]
-	return f
+	for item in f:
+		yield item
 
 def tokenize(document):
 	for line in document:
 		yield nltk.word_tokenize(line)
 
-def preprocess(location="../input/train.csv", itr=None, tokenized=False):
+def remove_stopwords(tokenized_list):
+	filtered_list = []
+	for word in tokenized_list:
+		if word not in stopwords:
+			filtered_list.append(word)
+	return filtered_list
+
+def lemmatize_words(tokenized_list):
+	filtered_list = []
+	word_pos = nltk.pos_tag(tokenized_list)
+	for word, pos in word_pos:
+		word = lemmatizer.lemmatize(word, pos)
+		filtered_list.append(word)
+	return filtered_list
+
+def preprocess(location="../input/train.csv", document=None, tokenized=False):
 	word_set = {}
-	if itr is None:
+	if document is None:
 		df = pd.read_csv(location)
-		itr = df["text"]
-	for sent in itr:
+		document = df["text"]
+	processed_doc = []
+	for sent in document:
+		processed_sent = []
 		if not tokenized:
-			sent = nltk.word_tokenize(sent)
-		for word in sent:
+			sent = tokenize(sent)
+		for word in lemmatize_words(remove_stopwords(sent)):
+			processed_sent.append(word)
 			if word_set.get(word) is None:
 				word_indx = len(word_set) + 1
 				word_set[word] = word_indx
 
-	def generate_pairs(word_distance, batch_size, itr=None):
-		if itr is None:
-			itr = df["text"]
+		processed_doc.append(processed_sent)
+	print(document[0])
+	print(processed_doc[0])
+
+	def generate_pairs(word_distance, batch_size):
 		context,target = [],[]
-		total_sentences = len(itr) 
-		for sent_indx, sentence in enumerate(shuffle(itr)):
+		total_sentences = len(processed_doc) 
+		for sent_indx, tokenized_list in enumerate(shuffle(processed_doc)):
 			if not tokenized:
-				tokenized_list = nltk.word_tokenize(sentence)
+				tokenized_list = tokenize(tokenized_list)
+			tokenized_list = list(remove_stopwords(tokenized_list))
 			for indx, context_word in enumerate(tokenized_list):
-				'''
-				for distance in range(indx - word_distance,indx + word_distance):
-					if distance == indx or distance < 0 or distance >= len(sentence):
-						continue
-					context.append(word_set[sentence[distance]])
-					target.append(word_set[words])
-					if len(context) == batch_size or sent_indx==total_sentences-1:
-						yield np.array(context),np.array(target)[...,np.newaxis]
-						context,target = [],[]
-				'''
 				#Sampling is suggested
 				context_row = [] 
 				for distance in range(indx - word_distance, indx + word_distance):
@@ -98,8 +114,10 @@ def preprocess(location="../input/train.csv", itr=None, tokenized=False):
 					context_row.append(word_set[tokenized_list[distance]])
 				context.append(context_row)
 				target.append(word_set[context_word])
-				if len(context) == batch_size or sent_indx == total_sentences - 1:
+				#Tensorflow gives not a matrix error for only one example ???
+				if (len(context) == batch_size or sent_indx == total_sentences - 1) and len(context) != 1:
 					yield np.array(context), np.array(target)[..., np.newaxis]
+					context, target = [], []
 
 	return generate_pairs, len(word_set), word_set
 
@@ -161,8 +179,8 @@ def train(embedding_size = 100, word_distance = 5, batch_size = 64, lr = 1e-3, e
 	inputs = tf.placeholder(tf.int32, [None, 2*word_distance])
 	labels = tf.placeholder(tf.int32, [None, 1])
 	
-	#document, train_x = imdb_dataset()
-	generate_pairs, vocab_size, word_set = preprocess()
+	document, train_x = imdb_dataset()
+	generate_pairs, vocab_size, word_set = preprocess(itr = document, tokenized = True)
 	
 	optimizer, loss, correct_prediction = model(vocab_size, embedding_size, (inputs, labels), lr, word_distance)
 	
@@ -175,22 +193,26 @@ def train(embedding_size = 100, word_distance = 5, batch_size = 64, lr = 1e-3, e
 				epoch_loss = 0
 				epoch_acc = 0
 				for indx,pair in enumerate(generate_pairs(word_distance, batch_size)):
-					context, target = pair
-					_, c, a  = sess.run(
-							[optimizer, loss, correct_prediction],
-							feed_dict = {inputs:context, labels:target}
-						)
-					epoch_loss += c
-					epoch_acc += a
-					if indx % (500) == 0:
-						logger.info(f"epoch:{e} indx:{indx}, loss:{epoch_loss} ") 
-						print(f"epoch:{e} indx:{indx}, loss:{epoch_loss} ")
 					if memory_above(95):
 						log_str = f"epoch:{e} indx:{indx}, terminating! high memory usage"
 						logger.info(log_str) 				
 						print(log_str)
+						del pair
+						gc.collect()
 						break
-				print(f"Accuracy {epoch_acc/indx}")
+					context, target = pair
+					_, c  = sess.run(
+							[optimizer, loss],
+							feed_dict = {inputs:context, labels:target}
+						)
+					epoch_loss += c
+					epoch_acc += 0
+					if indx % (50) == 0:
+						logger.info(f"{timestamp} epoch:{e} indx:{indx}, loss:{epoch_loss} ") 
+						print(f"epoch:{e} indx:{indx}, loss:{epoch_loss} ", end="\r")
+					if indx % (1_00_000) == 0:
+						saver.save(sess, os.path.join(logdir, "model.ckpt"), indx)
+				print(f"\nLoss: {epoch_loss}")
 			saver.save(sess, os.path.join(logdir, "model.ckpt"))
 		except KeyboardInterrupt as e:
 			print(str(e))
@@ -198,7 +220,7 @@ def train(embedding_size = 100, word_distance = 5, batch_size = 64, lr = 1e-3, e
 		finally:
 			save_dictionary = input("Save the dictionary?")
 			if save_dictionary.lower() != "no":
-				with open(logdir+"words/word_set.pickle","wb") as f:
+				with open(logdir+"word_set.pickle","wb") as f:
 					pickle.dump(word_set, f)
 def cosine_distance(v1, v2):
 	"""returns the cosine_distance"""
@@ -207,7 +229,7 @@ def cosine_distance(v1, v2):
 
 
 def load_file(path):
-	with open(path+"words/word_set.pickle","rb") as f:
+	with open(path+"word_set.pickle","rb") as f:
 		word_set = pickle.load(f)
 	
 	#Tensor weight
@@ -229,7 +251,7 @@ def test(path):
 			return None
 		vec = embedding[word_indx]
 		top_matches = [(None,-np.inf) for i in range(5)]
-		for indx,emb_vec in enumerate(embedding):
+		for indx,emb_vec in enumerate(embedding, 1):
 			distance = cosine_distance(vec, emb_vec)
 			if distance > top_matches[-1][1] and word_indx != indx:
 				top_matches[-1] = (idx_to_word[indx], distance)
@@ -239,9 +261,14 @@ def test(path):
 
 
 if __name__ == "__main__":
-	train(word_distance = 2, batch_size=8, lr=1e-4)
-	print("Testing")
-	most_similar = test("model/1536953904/")
-	while True:
-		word = input(":")
-		most_similar(word)
+	print(sys.argv)
+	if sys.argv[1] == "train":
+		train(embedding_size=100, word_distance=3, batch_size=32, lr=1e-2)
+	if sys.argv[1] == "test":
+		if len(sys.argv) != 3:
+			print("Enter directory")
+			sys.exit()
+		most_similar = test(f"model/{sys.argv[2]}/")
+		while True:
+			word = input("=>")
+			most_similar(word)
